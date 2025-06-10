@@ -62,6 +62,14 @@ python3 verify_setup.py
 
 Este script verifica que todo esté configurado correctamente.
 
+### Probar con Ejemplos
+
+```bash
+python3 ejemplos_uso.py
+```
+
+Script con ejemplos de uso y verificación del sistema.
+
 ## ⚙️ Configuración
 
 Edita el archivo `.env`:
