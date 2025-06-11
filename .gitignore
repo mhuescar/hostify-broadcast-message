@@ -41,6 +41,14 @@ ENV/
 # Environment variables (keep .env.example)
 .env
 
+# Progress files
+broadcast_progress.json
+
+# Test files
+test_*.py
+ejemplos_uso.py
+verify_setup.py
+
 # macOS
 .DS_Store
 .DS_Store?

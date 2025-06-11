@@ -23,6 +23,8 @@ import os
 from dotenv import load_dotenv
 from typing import List, Dict, Any, Optional
 import json
+import time
+from pathlib import Path
 
 # Cargar variables de entorno
 load_dotenv()
@@ -125,10 +127,119 @@ class HostifyAPI:
             "Content-Type": "application/json"
         }
     
-    def get_active_properties(self) -> List[Dict[str, Any]]:
-        """Obtiene todas las propiedades activas con paginación"""
+    def get_child_listings(self, parent_id: int) -> List[Dict[str, Any]]:
+        """Obtiene las propiedades child (Booking, Airbnb, Vrbo, etc.) para un parent_id específico"""
         
-        print("🏠 Obteniendo propiedades activas...")
+        all_child_listings = []
+        page = 1
+        max_pages = 10  # Límite de seguridad
+        
+        while page <= max_pages:
+            try:
+                params = {'page': page}
+                url_children = f"{self.base_url}/listings/children/{parent_id}"
+                
+                response = requests.get(url_children, headers=self.headers, params=params)
+                response.raise_for_status()
+                
+                data = response.json()
+                
+                if 'listings' not in data or not data['listings']:
+                    break
+                
+                page_children = data['listings']
+                all_child_listings.extend(page_children)
+                
+                # Si recibimos menos que una página completa, no hay más datos
+                if len(page_children) < 20:  # Tamaño típico de página
+                    break
+                    
+                page += 1
+                
+            except Exception as e:
+                print(f"⚠️ Error obteniendo children de {parent_id}, página {page}: {str(e)}")
+                break
+        
+        return all_child_listings
+
+    def get_all_listing_ids(self) -> Dict[str, List[int]]:
+        """
+        Obtiene TODOS los IDs de listings: tanto PARENT como CHILDREN
+        
+        Returns:
+            Dict con keys 'parent_ids' y 'all_ids' (parent + children)
+        """
+        
+        print("🏠 Obteniendo todas las propiedades activas (PARENT)...")
+        parent_properties = self.get_active_properties()
+        
+        parent_ids = []
+        all_listing_ids = []
+        
+        print(f"📊 Procesando {len(parent_properties)} propiedades parent...")
+        
+        for i, property_data in enumerate(parent_properties, 1):
+            parent_id = property_data.get("id")
+            property_name = property_data.get("name", f"Propiedad {parent_id}")
+            
+            if not parent_id:
+                continue
+                
+            parent_ids.append(parent_id)
+            all_listing_ids.append(parent_id)
+            
+            print(f"  {i:2d}. 🏠 Parent: {property_name} (ID: {parent_id})")
+            
+            # Obtener children de esta propiedad
+            try:
+                child_listings = self.get_child_listings(parent_id)
+                
+                if child_listings:
+                    print(f"      📋 Children encontrados: {len(child_listings)}")
+                    
+                    for child in child_listings:
+                        child_id = child.get('id')
+                        fs_type = child.get('fs_integration_type')
+                        is_listed = child.get('is_listed', 0)
+                        
+                        if child_id:
+                            all_listing_ids.append(child_id)
+                            
+                            # Mostrar tipo de integración
+                            integration_name = "Desconocido"
+                            if fs_type == 22:
+                                integration_name = "Booking.com"
+                            elif fs_type == 26:
+                                integration_name = "Vrbo"
+                            elif fs_type == 1 and is_listed == 1:
+                                integration_name = "Airbnb"
+                            elif fs_type == 1:
+                                integration_name = "Airbnb (no listado)"
+                            
+                            print(f"         └─ Child: {child_id} ({integration_name})")
+                else:
+                    print(f"      📋 Sin children")
+                    
+            except Exception as e:
+                print(f"      ❌ Error obteniendo children de {parent_id}: {str(e)}")
+                continue
+        
+        result = {
+            'parent_ids': parent_ids,
+            'all_ids': all_listing_ids
+        }
+        
+        print(f"\n📊 RESUMEN DE IDs:")
+        print(f"   📁 Parent IDs: {len(parent_ids)}")
+        print(f"   🔗 Total IDs (Parent + Children): {len(all_listing_ids)}")
+        print(f"   📈 Children promedio por Parent: {(len(all_listing_ids) - len(parent_ids)) / len(parent_ids) if parent_ids else 0:.1f}")
+        
+        return result
+
+    def get_active_properties(self) -> List[Dict[str, Any]]:
+        """Obtiene todas las propiedades activas con paginación (solo PARENT)"""
+        
+        print("🏠 Obteniendo propiedades activas (PARENT)...")
         all_properties = []
         page = 1
         
@@ -167,7 +278,7 @@ class HostifyAPI:
                 print(f"⚠️ Error en página {page}: {str(e)}")
                 break
         
-        print(f"✅ {len(all_properties)} propiedades activas encontradas en total")
+        print(f"✅ {len(all_properties)} propiedades parent encontradas en total")
         return all_properties
     
     def get_future_bookings_with_details(self, listing_id: str) -> List[Dict[str, Any]]:
@@ -176,6 +287,7 @@ class HostifyAPI:
         today = datetime.datetime.now().strftime("%Y-%m-%d")
         
         print(f"📋 Obteniendo reservas ACEPTADAS futuras para listing {listing_id}...")
+        print(f"    🗓️ Filtro de fecha: check-in >= {today}")
         
         # Ya no necesitamos filters array, usamos query params directos
         all_reservations = []
@@ -205,27 +317,48 @@ class HostifyAPI:
                 page_reservations = reservations_response.get("reservations", [])
                 total_reservations = reservations_response.get("total", 0)
                 
-                # Filtro adicional a nivel de código para asegurar solo "accepted"
-                accepted_reservations = [
-                    res for res in page_reservations 
-                    if res.get("status") == "accepted"
-                ]
+                print(f"  📊 Página {page}: {len(page_reservations)} reservas recibidas de API")
                 
+                # Filtro adicional a nivel de código para asegurar solo "accepted" Y fechas futuras
+                today_date = datetime.datetime.now().date()
+                accepted_reservations = []
+                
+                for res in page_reservations:
+                    reservation_id = res.get('id')
+                    checkin_str = res.get("checkIn", "")
+                    status = res.get("status", "")
+                    
+                    # Verificar status
+                    if status != "accepted":
+                        continue
+                    
+                    # Verificar fecha de check-in futura
+                    if checkin_str:
+                        try:
+                            checkin_date = datetime.datetime.strptime(checkin_str, "%Y-%m-%d").date()
+                            if checkin_date >= today_date:
+                                accepted_reservations.append(res)
+                                print(f"    ✅ Reserva {reservation_id} ACEPTADA: check-in={checkin_str}")
+                        except ValueError:
+                            continue
+                    else:
+                        continue
+                
+                # Enriquecer datos de cada reserva aceptada (si las hay)
                 if accepted_reservations:
-                    # Enriquecer datos de cada reserva aceptada
                     for reservation in accepted_reservations:
                         self._enrich_reservation_data(reservation)
-                    
                     all_reservations.extend(accepted_reservations)
-                    print(f"  📄 Página {page}: {len(accepted_reservations)} reservas aceptadas")
-                    
-                    # Verificar si hay más páginas
-                    if len(all_reservations) >= total_reservations or len(page_reservations) < page_size:
-                        has_more_data = False
-                    else:
-                        page += 1
-                else:
+                
+                print(f"  📄 Página {page}: {len(accepted_reservations)} reservas aceptadas de {len(page_reservations)} recibidas")
+                
+                # Verificar si hay más páginas BASADO EN LOS DATOS CRUDOS, no en los filtrados
+                if len(page_reservations) < page_size or len(page_reservations) == 0:
+                    # Si recibimos menos reservas que el tamaño de página, es la última página
                     has_more_data = False
+                else:
+                    # Continuar a la siguiente página
+                    page += 1
                     
             except Exception as e:
                 print(f"⚠️ Error en página {page}: {str(e)}")
@@ -314,7 +447,8 @@ class MessageProcessor:
             # Obtener URL de Chekin primero
             checkin_link = self._get_checkin_link(reservation_id, booking)
             if not checkin_link:
-                print(f"  ❌ No se encontró URL de Chekin para reserva {reservation_id} - mensaje NO enviado")
+                checkin_date = booking.get("checkIn", "N/A")
+                print(f"  ❌ Reserva {reservation_id} (check-in: {checkin_date}) - Sin URL de Chekin disponible - mensaje NO enviado")
                 return None
         
         # 1. Guest name
@@ -405,8 +539,84 @@ class MessageProcessor:
         
         return "Su alojamiento"
 
+class ProgressTracker:
+    """Controlador de progreso para evitar procesar propiedades ya completadas"""
+    
+    def __init__(self, progress_file: str = "broadcast_progress.json"):
+        self.progress_file = progress_file
+        self.completed_properties = self._load_progress()
+        self.current_session = {
+            "start_time": datetime.datetime.now().isoformat(),
+            "properties_processed": 0,
+            "messages_sent": 0,
+            "errors": []
+        }
+    
+    def _load_progress(self) -> set:
+        """Carga propiedades ya completadas"""
+        try:
+            if os.path.exists(self.progress_file):
+                with open(self.progress_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    completed = set(data.get("completed_properties", []))
+                    print(f"📋 Progreso cargado: {len(completed)} propiedades ya procesadas")
+                    return completed
+        except Exception as e:
+            print(f"⚠️ Error cargando progreso: {e}")
+        
+        return set()
+    
+    def _save_progress(self):
+        """Guarda el progreso actual"""
+        try:
+            progress_data = {
+                "completed_properties": list(self.completed_properties),
+                "last_update": datetime.datetime.now().isoformat(),
+                "session_summary": self.current_session
+            }
+            
+            with open(self.progress_file, 'w', encoding='utf-8') as f:
+                json.dump(progress_data, f, indent=2, ensure_ascii=False)
+                
+        except Exception as e:
+            print(f"⚠️ Error guardando progreso: {e}")
+    
+    def is_property_completed(self, property_id: str) -> bool:
+        """Verifica si una propiedad ya fue procesada"""
+        return str(property_id) in self.completed_properties
+    
+    def mark_property_completed(self, property_id: str, messages_sent: int):
+        """Marca una propiedad como completada"""
+        self.completed_properties.add(str(property_id))
+        self.current_session["properties_processed"] += 1
+        self.current_session["messages_sent"] += messages_sent
+        self._save_progress()
+        print(f"✅ Propiedad {property_id} marcada como completada ({messages_sent} mensajes)")
+    
+    def add_error(self, error_msg: str):
+        """Añade un error al registro"""
+        self.current_session["errors"].append(error_msg)
+        self._save_progress()
+    
+    def get_summary(self) -> dict:
+        """Obtiene resumen del progreso"""
+        return {
+            "total_completed": len(self.completed_properties),
+            "session": self.current_session
+        }
+    
+    def reset_progress(self):
+        """Reinicia el progreso (elimina archivo)"""
+        try:
+            if os.path.exists(self.progress_file):
+                os.remove(self.progress_file)
+                print("🗑️ Progreso reiniciado")
+            self.completed_properties = set()
+        except Exception as e:
+            print(f"⚠️ Error reiniciando progreso: {e}")
+
 def broadcast_message_to_specific_listing(listing_id: str, message_template: str) -> Dict[str, Any]:
-    """Envía mensajes a un listing específico usando datos reales"""
+    """Envía mensajes a un listing específico usando datos reales - TODAS las reservas"""
     
     processor = MessageProcessor()
     
@@ -423,11 +633,13 @@ def broadcast_message_to_specific_listing(listing_id: str, message_template: str
         future_bookings = processor.hostify.get_future_bookings_with_details(listing_id)
         results["total_bookings"] = len(future_bookings)
         
-        print(f"\n📨 Procesando {len(future_bookings)} reservas futuras")
+        print(f"\n📨 Procesando TODAS las {len(future_bookings)} reservas futuras")
         
-        for booking in future_bookings:
+        for i, booking in enumerate(future_bookings, 1):
             booking_id = booking["id"]
             guest_name = processor._extract_guest_name(booking)
+            
+            print(f"📧 {i}/{len(future_bookings)}: Procesando reserva #{booking_id} ({guest_name})")
             
             try:
                 # Procesar mensaje con datos reales
@@ -435,7 +647,7 @@ def broadcast_message_to_specific_listing(listing_id: str, message_template: str
                 
                 # Si no hay URL de Chekin, saltear esta reserva
                 if final_message is None:
-                    print(f"⚠️ Saltando reserva {booking_id} - No hay URL de Chekin disponible")
+                    print(f"   ⚠️ Saltando reserva {booking_id} - No hay URL de Chekin disponible")
                     continue
                 
                 # Enviar mensaje
@@ -443,16 +655,21 @@ def broadcast_message_to_specific_listing(listing_id: str, message_template: str
                 
                 if "error" not in result:
                     results["messages_sent"] += 1
-                    print(f"✅ Mensaje enviado a {guest_name} (Reserva #{booking_id})")
+                    print(f"   ✅ Mensaje enviado a {guest_name} (Reserva #{booking_id})")
                 else:
                     error_msg = f"Error en reserva {booking_id}: {result.get('error')}"
                     results["errors"].append(error_msg)
-                    print(f"⚠️ {error_msg}")
+                    print(f"   ⚠️ {error_msg}")
                     
             except Exception as e:
                 error_msg = f"Error procesando reserva {booking_id}: {str(e)}"
                 results["errors"].append(error_msg)
-                print(f"❌ {error_msg}")
+                print(f"   ❌ {error_msg}")
+        
+        print(f"\n📊 RESUMEN LISTING {listing_id}:")
+        print(f"   📋 Reservas encontradas: {results['total_bookings']}")
+        print(f"   ✅ Mensajes enviados: {results['messages_sent']}")
+        print(f"   ❌ Errores: {len(results['errors'])}")
         
         return results
         
@@ -462,113 +679,156 @@ def broadcast_message_to_specific_listing(listing_id: str, message_template: str
         print(f"❌ {error_msg}")
         return results
 
-def broadcast_message_to_all_future_bookings(message_template: str, property_summary: List[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Envía mensajes a todas las propiedades activas usando datos reales"""
+def broadcast_message_to_all_future_bookings(message_template: str, restart_progress: bool = False, listing_data: Dict[str, List[int]] = None) -> Dict[str, Any]:
+    """Envía mensajes a TODAS las reservas futuras (PARENT + CHILDREN) con control de progreso paso a paso"""
     
     processor = MessageProcessor()
+    progress = ProgressTracker()
+    
+    # Opción para reiniciar progreso
+    if restart_progress:
+        progress.reset_progress()
     
     results = {
-        "total_properties": 0,
+        "total_parent_properties": 0,
+        "total_listing_ids": 0,
+        "properties_processed": 0,
+        "properties_skipped": 0,
         "total_bookings": 0,
         "messages_sent": 0,
         "errors": [],
-        "chekin_available": processor.chekin.is_available
+        "chekin_available": processor.chekin.is_available,
+        "progress_file": progress.progress_file
     }
     
     try:
-        # Si ya tenemos los datos, usarlos. Si no, obtenerlos (retrocompatibilidad)
-        if property_summary is None:
-            print("🔄 Obteniendo datos de propiedades...")
-            # Obtener todas las propiedades activas (solo si no se pasaron datos)
-            properties = processor.hostify.get_active_properties()
-            results["total_properties"] = len(properties)
-            
-            if not properties:
-                print("❌ No se encontraron propiedades activas")
-                return results
-            
-            print(f"🏠 Procesando {len(properties)} propiedades activas")
-            
-            # Crear property_summary si no se pasó
-            property_summary = []
-            for property_data in properties:
-                listing_id = property_data.get("id") or property_data.get("listing_id")
-                property_name = property_data.get("name") or property_data.get("title", f"Propiedad {listing_id}")
-                
-                if not listing_id:
-                    continue
-                
-                try:
-                    print(f"\n🏠 {property_name} (ID: {listing_id})")
-                    future_bookings = processor.hostify.get_future_bookings_with_details(str(listing_id))
-                    
-                    if future_bookings:
-                        property_summary.append({
-                            "id": listing_id,
-                            "name": property_name,
-                            "reservations": len(future_bookings),
-                            "bookings": future_bookings
-                        })
-                    else:
-                        print(f"  ℹ️ No hay reservas futuras")
-                        
-                except Exception as e:
-                    error_msg = f"Error procesando {property_name}: {str(e)}"
-                    results["errors"].append(error_msg)
-                    print(f"❌ {error_msg}")
+        # 1. OBTENER TODOS LOS IDs (PARENT + CHILDREN) - SOLO SI NO SE PASARON
+        if listing_data is None:
+            print("🔄 Paso 1: Obteniendo TODOS los IDs de listings (Parent + Children)...")
+            listing_data = processor.hostify.get_all_listing_ids()
+        else:
+            print("🔄 Paso 1: Usando IDs previamente obtenidos...")
         
-        # Usar los datos (ya existentes o recién obtenidos)
-        results["total_properties"] = len(property_summary)
+        parent_ids = listing_data['parent_ids']
+        all_listing_ids = listing_data['all_ids']
         
-        print(f"📨 Procesando mensajes para {len(property_summary)} propiedades (datos {'reutilizados' if property_summary else 'obtenidos'})...")
+        results["total_parent_properties"] = len(parent_ids)
+        results["total_listing_ids"] = len(all_listing_ids)
         
-        for property_info in property_summary:
-            property_name = property_info["name"]
-            listing_id = property_info["id"]
-            future_bookings = property_info["bookings"]
+        if not all_listing_ids:
+            print("❌ No se encontraron listings activos")
+            return results
+        
+        print(f"✅ Sistema expandido: {len(parent_ids)} propiedades parent → {len(all_listing_ids)} IDs totales")
+        
+        # Mostrar resumen de progreso previo
+        if progress.completed_properties:
+            print(f"📋 Progreso anterior: {len(progress.completed_properties)} IDs ya completados")
+        
+        # 2. PROCESAR CADA LISTING ID PASO A PASO (PARENT + CHILDREN)
+        for i, listing_id in enumerate(all_listing_ids, 1):
+            # Determinar si es parent o child
+            is_parent = listing_id in parent_ids
+            listing_type = "PARENT" if is_parent else "CHILD"
             
-            results["total_bookings"] += len(future_bookings)
+            print(f"\n{'='*60}")
+            print(f"🏠 LISTING {i}/{len(all_listing_ids)}: ID {listing_id} ({listing_type})")
+            print(f"{'='*60}")
             
-            print(f"\n🏠 {property_name} (ID: {listing_id})")
-            
-            if not future_bookings:
-                print(f"  ℹ️ No hay reservas futuras")
+            # Verificar si ya fue procesado
+            if progress.is_property_completed(str(listing_id)):
+                print(f"⏭️ Listing ya completado anteriormente - SALTANDO")
+                results["properties_skipped"] += 1
                 continue
             
-            for booking in future_bookings:
-                booking_id = booking["id"]
-                guest_name = processor._extract_guest_name(booking)
+            try:
+                # 3. OBTENER RESERVAS DE ESTE LISTING
+                print(f"📋 Paso 2: Obteniendo reservas futuras del listing {listing_id}...")
+                future_bookings = processor.hostify.get_future_bookings_with_details(str(listing_id))
                 
-                try:
-                    # Procesar mensaje con datos reales
-                    final_message = processor.process_message(message_template, booking)
+                if not future_bookings:
+                    print(f"ℹ️ No hay reservas futuras - marcando como completado")
+                    progress.mark_property_completed(str(listing_id), 0)
+                    results["properties_processed"] += 1
+                    continue
+                
+                print(f"✅ {len(future_bookings)} reservas futuras encontradas")
+                results["total_bookings"] += len(future_bookings)
+                
+                # 4. ENVIAR MENSAJES PARA TODAS LAS RESERVAS DE ESTE LISTING
+                print(f"📨 Paso 3: Enviando mensajes a TODAS las {len(future_bookings)} reservas...")
+                listing_messages_sent = 0
+                
+                for j, booking in enumerate(future_bookings, 1):
+                    booking_id = booking["id"]
+                    guest_name = processor._extract_guest_name(booking)
                     
-                    # Si no hay URL de Chekin, saltear esta reserva
-                    if final_message is None:
-                        print(f"  ⚠️ Saltando reserva {booking_id} - No hay URL de Chekin disponible")
-                        continue
+                    print(f"   📧 {j}/{len(future_bookings)}: Procesando reserva #{booking_id} ({guest_name})")
                     
-                    # Enviar mensaje
-                    result = processor.hostify.send_chat_message(booking_id, final_message, booking)
-                    
-                    if "error" not in result:
-                        results["messages_sent"] += 1
-                        print(f"  ✅ Mensaje enviado a {guest_name} (#{booking_id})")
-                    else:
-                        error_msg = f"Error en reserva {booking_id}: {result.get('error')}"
-                        results["errors"].append(error_msg)
-                        print(f"  ⚠️ {error_msg}")
+                    try:
+                        # Procesar mensaje con datos reales
+                        final_message = processor.process_message(message_template, booking)
                         
-                except Exception as e:
-                    error_msg = f"Error procesando reserva {booking_id}: {str(e)}"
-                    results["errors"].append(error_msg)
-                    print(f"  ❌ {error_msg}")
+                        # Si no hay URL de Chekin, saltear esta reserva
+                        if final_message is None:
+                            print(f"      ⚠️ Sin URL de Chekin - saltando")
+                            continue
+                        
+                        # Enviar mensaje
+                        result = processor.hostify.send_chat_message(booking_id, final_message, booking)
+                        
+                        if "error" not in result:
+                            listing_messages_sent += 1
+                            results["messages_sent"] += 1
+                            print(f"      ✅ Mensaje enviado exitosamente")
+                        else:
+                            error_msg = f"Error en reserva {booking_id}: {result.get('error')}"
+                            results["errors"].append(error_msg)
+                            progress.add_error(error_msg)
+                            print(f"      ⚠️ Error: {result.get('error')}")
+                            
+                    except Exception as e:
+                        error_msg = f"Error procesando reserva {booking_id}: {str(e)}"
+                        results["errors"].append(error_msg)
+                        progress.add_error(error_msg)
+                        print(f"      ❌ Error: {str(e)}")
+                
+                # 5. MARCAR LISTING COMO COMPLETADO
+                progress.mark_property_completed(str(listing_id), listing_messages_sent)
+                results["properties_processed"] += 1
+                
+                print(f"✅ Listing completado: {listing_messages_sent} mensajes enviados de {len(future_bookings)} reservas")
+                
+                # Pequeña pausa para no sobrecargar APIs
+                if i < len(all_listing_ids):  # No pausar en el último listing
+                    print(f"⏳ Pausa de 2 segundos antes del siguiente listing...")
+                    time.sleep(2)
+                        
+            except Exception as e:
+                error_msg = f"Error general en listing {listing_id}: {str(e)}"
+                results["errors"].append(error_msg)
+                progress.add_error(error_msg)
+                print(f"❌ {error_msg}")
+                continue  # Continuar con el siguiente listing
+        
+        # RESUMEN FINAL
+        print(f"\n{'='*60}")
+        print(f"🎯 RESUMEN FINAL")
+        print(f"{'='*60}")
+        print(f"🏠 Propiedades PARENT: {results['total_parent_properties']}")
+        print(f"🔗 Total listings procesados (Parent + Children): {results['total_listing_ids']}")
+        print(f"✅ Listings completados: {results['properties_processed']}")
+        print(f"⏭️ Listings saltados (ya completados): {results['properties_skipped']}")
+        print(f"📨 Total de mensajes enviados: {results['messages_sent']}")
+        print(f"❌ Errores: {len(results['errors'])}")
+        print(f"📋 Archivo de progreso: {progress.progress_file}")
         
         return results
         
     except Exception as e:
-        error_msg = f"Error general: {str(e)}"
+        error_msg = f"Error crítico: {str(e)}"
         results["errors"].append(error_msg)
+        progress.add_error(error_msg)
         print(f"❌ {error_msg}")
         return results
 
@@ -640,65 +900,45 @@ def list_reservations_and_send(listing_id: str, message_template: str):
         return None
 
 def list_all_reservations_and_send(message_template: str):
-    """Lista todas las reservas y envía mensajes directamente"""
+    """Lista todas las reservas y envía mensajes directamente usando sistema Parent + Children OPTIMIZADO"""
     
     processor = MessageProcessor()
     
     try:
-        print("🔍 Buscando todas las propiedades activas...")
-        properties = processor.hostify.get_active_properties()
+        print("🔍 Verificando conectividad y configuración...")
         
-        if not properties:
-            print("❌ No se encontraron propiedades activas.")
+        # CAPTURAR IDs UNA SOLA VEZ
+        print("📋 Obteniendo estructura de listings (UNA SOLA VEZ)...")
+        listing_data = processor.hostify.get_all_listing_ids()
+        parent_ids = listing_data['parent_ids'] 
+        all_listing_ids = listing_data['all_ids']
+        
+        if not all_listing_ids:
+            print("❌ No se encontraron listings activos.")
             return
         
-        total_reservations = 0
-        property_summary = []
-        
-        for property_data in properties:
-            listing_id = property_data.get("id") or property_data.get("listing_id")
-            property_name = property_data.get("name") or property_data.get("title", f"Propiedad {listing_id}")
-            
-            if not listing_id:
-                continue
-            
-            try:
-                future_bookings = processor.hostify.get_future_bookings_with_details(str(listing_id))
-                if future_bookings:
-                    total_reservations += len(future_bookings)
-                    property_summary.append({
-                        "id": listing_id,
-                        "name": property_name,
-                        "reservations": len(future_bookings),
-                        "bookings": future_bookings
-                    })
-                    print(f"  ✅ {property_name}: {len(future_bookings)} reservas futuras")
-                else:
-                    print(f"  ⚪ {property_name}: Sin reservas futuras")
-            except Exception as e:
-                print(f"  ❌ Error en {property_name}: {str(e)}")
-        
-        if total_reservations == 0:
-            print("\n❌ No se encontraron reservas futuras en ninguna propiedad.")
-            return
-        
-        print("\n" + "=" * 80)
-        print(f"📊 RESUMEN TOTAL:")
-        print(f"   - Propiedades con reservas: {len(property_summary)}")
-        print(f"   - Total de reservas futuras: {total_reservations}")
+        print(f"✅ Sistema expandido detectado:")
+        print(f"   📁 {len(parent_ids)} propiedades PARENT")
+        print(f"   🔗 {len(all_listing_ids)} listings TOTALES (Parent + Children)")
+        print(f"   📈 Expansión: {len(all_listing_ids) - len(parent_ids)} children adicionales")
         print(f"📨 Mensaje a enviar: '{message_template}'")
-        print("=" * 80)
         
-        # Mostrar preview
-        if property_summary and property_summary[0]["bookings"]:
-            print(f"\n📝 Preview del mensaje procesado:")
-            test_booking = property_summary[0]["bookings"][0]
-            preview_message = processor.process_message(message_template, test_booking)
-            print(f"   {preview_message}")
+        # Mostrar preview rápido si es posible
+        try:
+            # Obtener una muestra de reserva para preview (del primer listing)
+            if all_listing_ids:
+                sample_listing_id = all_listing_ids[0]
+                sample_bookings = processor.hostify.get_future_bookings_with_details(str(sample_listing_id))
+                if sample_bookings:
+                    print(f"\n📝 Preview del mensaje procesado (listing {sample_listing_id}):")
+                    preview_message = processor.process_message(message_template, sample_bookings[0])
+                    print(f"   {preview_message}")
+        except:
+            print("\n📝 Preview no disponible (se generará durante el envío)")
         
-        # Enviar directamente sin confirmación - OPTIMIZADO: pasar datos ya obtenidos
-        print("\n✅ Enviando mensajes (usando datos ya obtenidos para evitar duplicar llamadas API)...")
-        result = broadcast_message_to_all_future_bookings(message_template, property_summary)
+        # PASAR LOS IDs YA OBTENIDOS para evitar recaptura
+        print("\n✅ Iniciando envío paso a paso con sistema Parent + Children...")
+        result = broadcast_message_to_all_future_bookings(message_template, listing_data=listing_data)
         return result
             
     except Exception as e:
@@ -711,20 +951,39 @@ if __name__ == "__main__":
     print("=" * 60)
     
     # Mensaje por defecto con variables corregidas
-    default_message = "Hola {{guest_name}}, por favor completa tu check-in: {{chekin_signup_form_link}}"
+    default_message = "Ignore este mensaje si ya completó el check-in: Hola {{guest_name}}, hemos mejorado nuestro proceso de check-in y ahora el enlace para completarlo es este. No dude en preguntarnos ante cualquier duda: {{chekin_signup_form_link}} "
     
     print("Opciones disponibles:")
     print("1. Enviar mensaje a un listing específico")
     print("2. Enviar mensaje a TODAS las propiedades activas")
     print("3. Cargar mensaje desde archivo")
+    print("4. Reiniciar progreso y empezar desde cero")
     
     while True:
         try:
-            opcion = input("\nSelecciona una opción (1-3): ").strip()
+            opcion = input("\nSelecciona una opción (1-4): ").strip()
             
             message_template = default_message
             
-            if opcion == "3":
+            if opcion == "4":
+                # Reiniciar progreso
+                from pathlib import Path
+                progress_file = "broadcast_progress.json"
+                if Path(progress_file).exists():
+                    confirm = input("⚠️ ¿Seguro que quieres eliminar el progreso guardado? (s/N): ").strip().lower()
+                    if confirm == 's':
+                        try:
+                            Path(progress_file).unlink()
+                            print("✅ Progreso reiniciado")
+                        except Exception as e:
+                            print(f"❌ Error eliminando archivo: {e}")
+                    else:
+                        print("Cancelado")
+                else:
+                    print("ℹ️ No hay progreso guardado para eliminar")
+                continue
+            
+            elif opcion == "3":
                 # Cargar desde archivo
                 file_path = input("Ruta del archivo (Enter para mensaje_prueba_final): ").strip()
                 if not file_path:
@@ -773,7 +1032,7 @@ if __name__ == "__main__":
                 break
             
             else:
-                print("❌ Opción no válida. Selecciona 1, 2 o 3.")
+                print("❌ Opción no válida. Selecciona 1, 2, 3 o 4.")
                 
         except KeyboardInterrupt:
             print("\n\n👋 Programa interrumpido. ¡Hasta luego!")
