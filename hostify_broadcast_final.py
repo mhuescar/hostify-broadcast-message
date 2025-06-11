@@ -33,10 +33,14 @@ class ChekinConnector:
     """Conector para la API de Chekin con autenticación JWT oficial"""
     
     def __init__(self):
-        self.api_key = "VfviZ9WBLi4dvHJr97tBRcuBMOoYlHri"
+        self.api_key = os.getenv("CHEKIN_API_KEY")
         self.base_url = "https://a.chekin.io/public/api/v1"
         self.jwt_token = None
         self.is_available = False
+        
+        if not self.api_key:
+            print("⚠️ CHEKIN_API_KEY no está configurada en las variables de entorno")
+            return
         
         # Intentar obtener token JWT
         self._authenticate()

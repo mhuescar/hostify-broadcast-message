@@ -76,9 +76,12 @@ Edita el archivo `.env`:
 
 ```env
 HOSTIFY_API_KEY=tu_api_key_de_hostify_aqui
+CHEKIN_API_KEY=tu_api_key_de_chekin_aqui
 ```
 
-**Nota**: La API key de Chekin ya está incluida y configurada.
+**Cómo obtener las API keys:**
+- **Hostify**: Disponible en https://app.hostify.com/settings/integrations
+- **Chekin**: Contactar con soporte de Chekin para obtener acceso
 
 ## 🎯 Uso
 
